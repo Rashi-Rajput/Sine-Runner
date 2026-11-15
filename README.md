@@ -11,13 +11,43 @@ python -m pip install -r requirements.txt
 python game.py
 ```
 
+Without `--seed`, every launch creates a new terrain waveform and a new object layout. The chosen seed is printed so the exact course can be replayed later:
+
+```bash
+python game.py --seed 12345
+```
+
+Restarting with `R` keeps the current seed and course, so a retry is fair. Relaunch without `--seed` for another terrain.
+
 Useful checks:
 
 ```bash
 pytest -q
 python game.py --headless --seed 42 --frames 1000 --out out/
+python game.py --benchmark --seed 42 --frames 1000
 python game.py --report --out out/report/
 ```
+
+## Reinforcement-learning player
+
+The PPO agent lives entirely in `rl/` and wraps the unchanged game engine. See [the RL guide](rl/RL_README.md) for training, evaluation, live playback, and TensorBoard graphs.
+
+```bash
+python -m pip install -r rl/requirements-rl.txt
+python -m rl.train_rl --timesteps 5000000 --envs 8 --seed 42 --gamma 0.995 --output rl/checkpoints-new
+python -m rl.evaluate_rl --model rl/checkpoints-g995-42/final_model.zip
+python -m rl.play_agent --model rl/checkpoints-g995-42/final_model.zip --seed 42
+tensorboard --logdir rl/checkpoints-g995-42/runs
+```
+
+For a reproducible comparison against random actions and the scripted controller:
+
+```bash
+python -m rl.evaluate_rl --model rl/checkpoints-g995-42/final_model.zip --compare --json rl/results/g995-final.json
+python -m pytest -q tests rl/tests
+```
+
+The RL guide includes the benchmark protocol, measured results, limitations, and checkpoint resume command. The policy uses structured game telemetry rather than images. On [100 unseen courses](rl/results/README.md), the final PPO model completed 91%, versus 26% for random actions and 71% for the scripted controller. This is a single-run result; repeat it with additional training seeds before claiming a stable average.
 
 Headless mode runs the same fixed-step game loop without opening a window. It writes `wave_frameXXXXXX.png` captures and prints a SHA-256 logic hash. If an OpenGL context cannot be created, it announces that fact and writes a simple Pillow diagnostic frame instead.
 
@@ -26,26 +56,41 @@ Headless mode runs the same fixed-step game loop without opening a window. It wr
 - `W`, `Up`, or `Space`: jump
 - `Right` or `D`: hold boost
 - `Left` or `A`: brake
+- `Down` or `S`: slide
 - `P`: pause
 - `H`: show or hide help
 - `R`: restart
 - `Esc`: quit
 
-The game has one course. It is deliberately one coherent visual and musical experience rather than a selector containing several loosely related themes.
+The game has one course style and one coherent visual and musical theme, but its terrain waveform and object layout are regenerated for each unseeded launch.
 
 ## How the game is organised
 
-`game.py` is split into a few practical systems:
+The game is a Python package split by responsibility:
 
-1. **Math and deterministic helpers** generate repeatable values from sine.
-2. **Wave Surfer simulation** advances the rider, terrain, pickups, and collisions.
-3. **WaveField** creates a decorative 2D ripple simulation.
-4. **ModernGL renderer** draws the scene procedurally in a fragment shader.
-5. **Audio synthesis** creates the music and sound effects as arrays of samples.
-6. **Pygame loop** handles input, timing, menus, and presentation.
-7. **Headless mode and tests** verify that the simulation remains reproducible.
+1. `game/terrain.py` owns sine math, seeded terrain, domain randomization, and fairness validation.
+2. `game/surfer.py` owns inputs, rider state, fixed-step movement, scoring, and logic hashes.
+3. `game/collision.py` owns swept contacts, collision records, pickups, springs, and breaker damage.
+4. `game/renderer.py` owns the float32 wave field, shaders, and ModernGL renderer.
+5. `game/audio.py` owns procedural music, sound effects, and playback.
+6. `game/main.py` owns menus, UI, headless mode, benchmarks, reports, and the CLI.
+7. `tests/` contains game tests; `rl/tests/` checks the RL environment and evaluation.
 
-The file also contains an older lane-runner model (`GameState`, `LevelData`, and `update_game`) retained for compatibility tests. The interactive game uses the newer `SurferState` and `update_surfer` path.
+The root `game.py` is only a compatibility launcher, so existing `python game.py` commands still work. The older lane-runner API is isolated in `game/legacy.py`; the executable, renderer, human game, and RL player use only `SurferState` and `update_surfer`.
+
+## Terrain difficulty, fairness, and domain randomization
+
+Every generated course carries a `TerrainDomain`. It contains the seeded amplitude, frequency, fine-detail amount, object spacing, friction, boost strength, and gravity. Supplying the same seed, stage, and difficulty reproduces the same values exactly.
+
+Five difficulty stages are available:
+
+1. `smooth`: broad low waves with almost no hazards
+2. `moderate`: taller and faster terrain
+3. `compound`: layered harmonics and finer surface detail
+4. `obstacles`: wider hazard variety
+5. `full`: all terrain and object variation
+
+`validate_surf_level()` samples the analytic terrain before play. It reports peak squared slope, peak squared curvature, closest breaker spacing, and reasons for rejection. Breakers are only placed on safe sections with enough reaction distance; an unsafe planned breaker is replaced by a coin. This keeps random maps varied without making them arbitrarily unfair.
 
 ## 1. The terrain: a layered sine wave
 
@@ -53,16 +98,18 @@ The ground height is based on several sine waves added together:
 
 ```text
 F(phi) = sin(phi)
-       + 0.42 sin(2.3 phi + 1.1)
-       + 0.18 sin(4.7 phi - 0.6)
+       + a2 sin(r2 phi + p2)
+       + a3 sin(r3 phi + p3)
 
 y(s) = A(s) F(phi(s))
 ```
 
-`s` is distance along the course. `A(s)` grows with progress, so the hills become taller. The phase is a chirp:
+The run seed deterministically chooses `a2`, `a3`, `r2`, `r3`, the phase offsets, the starting amplitude, and the frequency range. This makes each new run a genuinely different layered wave rather than merely moving the obstacles.
+
+`s` is distance along the course. `A(s)` grows with progress, so the hills become taller. The main phase is a chirp:
 
 ```text
-phi(s) = k0 s + 1/2 chirp s²
+phi(s) = p0 + k0 s + 1/2 chirp s²
 ```
 
 Because the phase contains `s²`, its derivative increases as the rider travels. The hills gradually become closer together instead of repeating with one fixed wavelength.
@@ -136,9 +183,11 @@ The gameplay objects have different jobs:
 
 Objects are checked using the distance crossed during the current fixed step. This is important: checking only the current position could skip a thin obstacle when the rider moves quickly. The code checks whether the interval from the old distance to the new distance overlaps the object's position.
 
+Each contact creates a `CollisionRecord` containing the object type, object index, contact altitude, outcome, and exact heart change. Coins, fuel, and springs always have a heart delta of zero. Only a damaging breaker record can have `heart_delta = -1`. This makes collision bugs visible to tests, the UI, and the RL reward system.
+
 ## 4. Deterministic placement and the sine hash
 
-The project does not use Python's `random` module. It uses:
+The game terrain generator uses a sine hash rather than Python's `random` module. The RL libraries use their own seeded random number generators:
 
 ```python
 def sine_hash(n, k):
@@ -192,7 +241,7 @@ This is not random in the usual sense. It is deliberately structured, repeatable
 
 ## 7. The wave-field simulation and the CFL constant
 
-`WaveField` is a small two-dimensional leapfrog wave solver used only for decorative ripples. It stores the current grid and the previous grid, then applies a discrete Laplacian:
+`WaveField` is a small two-dimensional leapfrog wave solver used only for decorative ripples. It uses float32 arrays and rotates preallocated current, previous, next, Laplacian, and scratch buffers instead of creating full grids every frame. It then applies a discrete Laplacian:
 
 ```text
 u(next) = 2u(current) - u(previous)
@@ -232,7 +281,9 @@ It draws:
 
 This approach avoids large texture assets and keeps the scene resolution-independent. The CPU sends state and object data; the GPU performs the per-pixel work.
 
-The interactive path does not read the framebuffer back to the CPU every frame. Headless mode reads pixels only when it needs to save a capture.
+The human interactive path does not read the framebuffer back to the CPU every frame. Game headless mode reads pixels for captures; the RL viewer reads rendered pixels each frame for its Pygame window.
+
+The rider is also procedural. Sine-driven poses react to terrain pitch, vertical velocity, airtime, boost, sliding, landing compression, and collision tumble. No sprite sheet is needed, and the animation remains aligned with the same authoritative physics state used by collision detection.
 
 ## 9. Procedural audio
 
@@ -289,6 +340,11 @@ The test suite covers:
 - Audio envelopes.
 - Logic-hash determinism.
 - The sine-only linter.
+- Terrain fairness and deterministic domain randomization.
+- Collision records and heart deltas.
+- Float32 buffer reuse and a core frame-time budget.
+
+The performance check reports mean, 95th-percentile, and 99th-percentile simulation cost. It excludes disk capture and display synchronization so it can catch physics or wave-solver regressions reliably on development machines.
 
 ## What could have been used instead?
 
@@ -338,7 +394,7 @@ Recorded audio would usually sound more expressive. Procedural audio was chosen 
 - A replay or command-log system for input recording.
 - A GPU ping-pong texture for the ripple solver.
 
-For this small single-player project, the current single-file structure is convenient, but splitting the active surfer code into modules would improve maintainability as the game grows.
+The project now uses separate terrain, simulation, collision, renderer, audio, application, RL, and test modules. A larger version could go further with an Entity-Component-System, but that would add unnecessary indirection to the current game.
 
 ## Sine-only rule
 

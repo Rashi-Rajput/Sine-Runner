@@ -1,0 +1,10 @@
+# Training outputs and model checkpoints.
+checkpoints*/
+*.zip
+events.out.tfevents.*
+best_score.json
+evaluations.jsonl
+
+# Temporary local runs.
+smoke*/
+__pycache__/
