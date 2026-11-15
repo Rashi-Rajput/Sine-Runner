@@ -223,13 +223,34 @@ def test_wave_surfer_analytic_derivatives_match_finite_differences():
     level = game.generate_surf_level(0)
     ds = 1e-3
     for s in np.linspace(10.0, level.length - 10.0, 40):
-        height, slope, curvature = game.wave_geometry(float(s), level.index, level.length)
-        left = game.wave_geometry(float(s - ds), level.index, level.length)[0]
-        right = game.wave_geometry(float(s + ds), level.index, level.length)[0]
+        height, slope, curvature = game.wave_geometry(float(s), level.index, level.length, level.seed)
+        left = game.wave_geometry(float(s - ds), level.index, level.length, level.seed)[0]
+        right = game.wave_geometry(float(s + ds), level.index, level.length, level.seed)[0]
         numerical_slope = (right - left) / (2.0 * ds)
         numerical_curve = (right - 2.0 * height + left) / (ds * ds)
         assert slope == pytest.approx(numerical_slope, rel=2e-6, abs=8e-8)
         assert curvature == pytest.approx(numerical_curve, rel=2e-4, abs=2e-7)
+
+
+def test_wave_surfer_seed_changes_terrain_and_objects_reproducibly():
+    first = game.generate_surf_level(0, 42)
+    repeated = game.generate_surf_level(0, 42)
+    different = game.generate_surf_level(0, 43)
+    sample_points = (0.0, 75.0, 190.0, 420.0)
+    first_wave = tuple(game.wave_geometry(s, 0, first.length, first.seed)[0] for s in sample_points)
+    repeated_wave = tuple(game.wave_geometry(s, 0, repeated.length, repeated.seed)[0] for s in sample_points)
+    different_wave = tuple(game.wave_geometry(s, 0, different.length, different.seed)[0] for s in sample_points)
+    assert first_wave == repeated_wave
+    assert first.things == repeated.things
+    assert first_wave != different_wave
+    assert first.things != different.things
+    assert game.resolve_run_seed(42) == 42
+
+
+def test_new_unseeded_runs_receive_new_seeds(monkeypatch):
+    times = iter((1_000_000_001, 1_000_000_002))
+    monkeypatch.setattr(game.time, "time_ns", lambda: next(times))
+    assert game.resolve_run_seed(None) != game.resolve_run_seed(None)
 
 
 def test_wave_surfer_ballistic_jump_and_determinism():
@@ -273,3 +294,65 @@ def test_spring_is_high_jump_and_only_one_track_is_shipped():
     assert len(game.LEVELS) == 1
     with pytest.raises(ValueError):
         game.generate_surf_level(1)
+
+
+def test_generated_terrain_is_fair_reproducible_and_domain_randomized():
+    for stage in game.DIFFICULTY_STAGES:
+        first = game.generate_surf_level(0, 73, stage=stage, difficulty=0.8)
+        repeated = game.generate_surf_level(0, 73, stage=stage, difficulty=0.8)
+        assert first.fairness.valid
+        assert first.domain == repeated.domain
+        assert first.things == repeated.things
+    domains = [game.generate_surf_level(0, seed).domain for seed in range(10, 16)]
+    assert len({(item.object_spacing, item.friction, item.boost_strength, item.gravity)
+                for item in domains}) == len(domains)
+    unfair = game.SurfLevel(0, 73, 100.0, [
+        game.SurfThing(20.0, "breaker"), game.SurfThing(25.0, "breaker")
+    ], 0)
+    report = game.validate_surf_level(unfair)
+    assert not report.valid
+    assert "breakers are too close" in "; ".join(report.reasons)
+
+
+def test_collision_records_explain_exactly_when_a_heart_is_lost():
+    level = game.SurfLevel(0, 5, 100.0, [game.SurfThing(0.15, "breaker")], 0)
+    state = game.SurferState(level)
+    game.update_surfer(state, game.Inputs(), 0.02)
+    assert state.hearts == 2
+    assert state.last_collision == state.collisions[-1]
+    assert state.last_collision.kind == "breaker"
+    assert state.last_collision.heart_delta == -1
+    assert state.last_collision.outcome == "damaged"
+
+    level = game.SurfLevel(0, 5, 100.0, [game.SurfThing(0.15, "coin")], 1)
+    state = game.SurferState(level)
+    game.update_surfer(state, game.Inputs(), 0.02)
+    assert state.hearts == 3
+    assert state.collisions[-1].heart_delta == 0
+
+
+def test_wave_field_uses_float32_reusable_buffers_and_meets_core_budget():
+    field = game.WaveField(48)
+    assert field.u.dtype == np.float32
+    buffer_ids = {id(field.u), id(field.old), id(field._next)}
+    for _ in range(12):
+        field.step()
+    assert {id(field.u), id(field.old), id(field._next)} == buffer_ids
+    result = game.benchmark_core(120, 42)
+    assert result["mean_ms"] < 10.0
+    assert result["p99_ms"] < 25.0
+
+
+def test_surfer_animation_state_tracks_slide_air_and_landing():
+    state = game.SurferState(game.SurfLevel(0, 9, 100.0, [], 0))
+    game.update_surfer(state, game.Inputs(slide=True))
+    assert state.sliding and state.action == "slide"
+    game.update_surfer(state, game.Inputs(jump=True))
+    assert not state.grounded and state.air_time > 0.0
+    for _ in range(180):
+        game.update_surfer(state, game.Inputs())
+        if "land" in state.events:
+            break
+    assert state.grounded
+    assert state.landing_compression >= 0.0
+
